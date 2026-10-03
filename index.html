@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QR file receiver</title>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;padding:1rem;background:#111;color:#eee}
+  h1{font-size:1.2rem;margin:.2rem 0 .8rem}
+  video{width:100%;max-height:55vh;background:#000;border-radius:8px;object-fit:cover}
+  button{font-size:1rem;padding:.7rem 1rem;margin:.3rem .3rem .3rem 0;border:0;border-radius:6px;background:#2a7;color:#fff}
+  button.sec{background:#445}
+  #status{margin:.6rem 0;min-height:1.4em}
+  #bar{height:10px;background:#333;border-radius:5px;overflow:hidden}
+  #fill{height:100%;width:0;background:#2a7;transition:width .15s}
+  #cells{display:flex;flex-wrap:wrap;gap:3px;margin:.6rem 0}
+  #cells i{width:14px;height:14px;background:#333;border-radius:2px}
+  #cells i.on{background:#2a7}
+  a.dl{display:inline-block;padding:.8rem 1.2rem;background:#27c;color:#fff;border-radius:6px;text-decoration:none;margin-top:.5rem}
+  .err{color:#f66}
+</style></head><body>
+<h1>QR file receiver</h1>
+<video id="v" playsinline muted></video>
+<div>
+  <button id="start">Start camera</button>
+  <button id="reset" class="sec">Reset</button>
+</div>
+<div id="status">Press "Start camera", then point it at the QR codes.</div>
+<div id="bar"><div id="fill"></div></div>
+<div id="cells"></div>
+<div id="result"></div>
+<canvas id="c" hidden></canvas>
+
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const video = $('v'), canvas = $('c'), ctx = canvas.getContext('2d', {willReadFrequently:true});
+let stream = null, scanning = false, tid = null, total = 0, meta = null, parts = {};
+
+function setStatus(msg, err){ $('status').textContent = msg; $('status').className = err ? 'err' : ''; }
+
+function reset(){
+  tid = null; total = 0; meta = null; parts = {};
+  $('result').innerHTML = ''; $('cells').innerHTML = ''; $('fill').style.width = '0';
+  setStatus(stream ? 'Scanning…' : 'Press "Start camera", then point it at the QR codes.');
+}
+
+function drawProgress(){
+  const have = Object.keys(parts).length;
+  $('fill').style.width = (total ? have/total*100 : 0) + '%';
+  const cells = $('cells');
+  if(cells.children.length !== total){
+    cells.innerHTML = '';
+    for(let i=0;i<total;i++) cells.appendChild(document.createElement('i'));
+  }
+  for(let i=0;i<total;i++) cells.children[i].className = parts[i] !== undefined ? 'on' : '';
+  setStatus(`Received ${have} / ${total} frames` + (meta ? ` — ${meta.name}` : ''));
+}
+
+function handle(bin){
+  const d = Uint8Array.from(bin);
+  if(d.length < 12 || String.fromCharCode(d[0],d[1],d[2],d[3]) !== 'QRT1') return;   // not ours
+  const id = [...d.slice(4,8)].map(b=>b.toString(16).padStart(2,'0')).join('');
+  const i = (d[8]<<8)|d[9], n = (d[10]<<8)|d[11], payload = d.slice(12);
+  if(tid && id !== tid){                                   // different transfer: start over
+    parts = {}; meta = null; $('result').innerHTML = '';
+  }
+  if(!tid || id !== tid){ tid = id; total = n; }
+  if(parts[i] !== undefined) return;
+  parts[i] = payload;
+  if(i === 0) meta = JSON.parse(new TextDecoder().decode(payload));
+  if(navigator.vibrate) navigator.vibrate(30);
+  drawProgress();
+  if(Object.keys(parts).length === total) finish();
+}
+
+async function finish(){
+  scanning = false;
+  setStatus('All frames received, rebuilding…');
+  try{
+    const chunks = [];
+    for(let i=1;i<total;i++) chunks.push(parts[i]);
+    let bytes = await new Blob(chunks).arrayBuffer();
+    if(meta.zlib){
+      if(typeof DecompressionStream === 'undefined') throw new Error('This browser cannot decompress (needs a recent Chrome/Safari/Firefox). Re-encode with --no-compress.');
+      const ds = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+      bytes = await new Response(ds).arrayBuffer();
+    }
+    let ok = 'not verified';
+    if(window.crypto && crypto.subtle){
+      const h = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');
+      if(h !== meta.sha256) throw new Error('Checksum mismatch — file corrupted. Press Reset and scan again.');
+      ok = 'checksum OK';
+    }
+    const blob = new Blob([bytes], {type:'application/octet-stream'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.className = 'dl'; a.href = url; a.download = meta.name;
+    a.textContent = `Save ${meta.name} (${bytes.byteLength.toLocaleString()} bytes)`;
+    $('result').innerHTML = '';
+    $('result').appendChild(a);
+    if(navigator.canShare && navigator.canShare({files:[new File([blob], meta.name)]})){
+      const b = document.createElement('button');
+      b.textContent = 'Share / save to…';
+      b.onclick = () => navigator.share({files:[new File([blob], meta.name)]}).catch(()=>{});
+      $('result').appendChild(b);
+    }
+    setStatus(`Done: ${meta.name} rebuilt (${ok}).`);
+  }catch(e){
+    setStatus(e.message, true);
+  }
+}
+
+function tick(){
+  if(!scanning) return;
+  if(video.readyState === video.HAVE_ENOUGH_DATA){
+    const scale = Math.min(1, 1000 / video.videoWidth);
+    canvas.width = video.videoWidth * scale; canvas.height = video.videoHeight * scale;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const code = jsQR(img.data, img.width, img.height, {inversionAttempts:'dontInvert'});
+    if(code && code.binaryData) handle(code.binaryData);
+  }
+  requestAnimationFrame(tick);
+}
+
+$('start').onclick = async () => {
+  if(typeof jsQR === 'undefined'){ setStatus('QR library failed to load (check internet connection).', true); return; }
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment', width:{ideal:1280}}, audio:false});
+    video.srcObject = stream; await video.play();
+    scanning = true; setStatus('Scanning…'); tick();
+  }catch(e){
+    setStatus('Camera unavailable: ' + e.message + (location.protocol === 'http:' && location.hostname !== 'localhost' ? ' (camera needs HTTPS)' : ''), true);
+  }
+};
+$('reset').onclick = () => { reset(); if(stream && !scanning){ scanning = true; tick(); } };
+</script></body></html>
