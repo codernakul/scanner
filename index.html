@@ -22,6 +22,13 @@
 <div>
   <button id="start">Start camera</button>
   <button id="reset" class="sec">Reset</button>
+  <button id="req" class="sec" disabled>Request missing frames</button>
+</div>
+<div id="reqbox" hidden style="background:#fff;color:#000;padding:.6rem;border-radius:8px;margin:.5rem 0;text-align:center">
+  <div id="reqqr" style="max-width:min(90vw,420px);margin:auto"></div>
+  <div id="reqtxt" style="font-size:.85rem;margin:.4rem 0;word-break:break-word"></div>
+  <div style="font-size:.85rem">Show this to the sender page's camera ("Scan missing frames request").</div>
+  <button id="reqclose" class="sec">Close</button>
 </div>
 <div id="status">Press "Start camera", then point it at the QR codes.</div>
 <div id="bar"><div id="fill"></div></div>
@@ -30,6 +37,7 @@
 <canvas id="c" hidden></canvas>
 
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const video = $('v'), canvas = $('c'), ctx = canvas.getContext('2d', {willReadFrequently:true});
@@ -40,10 +48,52 @@ function setStatus(msg, err){ $('status').textContent = msg; $('status').classNa
 function reset(){
   tid = null; total = 0; meta = null; parts = {};
   $('result').innerHTML = ''; $('cells').innerHTML = ''; $('fill').style.width = '0';
+  $('req').disabled = true; $('reqbox').hidden = true;
   setStatus(stream ? 'Scanning…' : 'Press "Start camera", then point it at the QR codes.');
 }
 
+// Build the "missing frames" request payload: ranges ("0,4-9") or a bitmap, whichever is shorter.
+function requestPayload(){
+  const missing = [];
+  for(let k=0;k<total;k++) if(parts[k] === undefined) missing.push(k);
+  const ranges = [];
+  for(let s=0; s<missing.length;){
+    let e = s;
+    while(e+1 < missing.length && missing[e+1] === missing[e]+1) e++;
+    ranges.push(missing[s] === missing[e] ? '' + missing[s] : missing[s] + '-' + missing[e]);
+    s = e + 1;
+  }
+  const bytes = new Uint8Array(Math.ceil(total/8));
+  for(const k of missing) bytes[k>>3] |= 0x80 >> (k&7);
+  let bs = ''; for(const b of bytes) bs += String.fromCharCode(b);
+  const r = 'r|' + ranges.join(','), b = 'b|' + btoa(bs);
+  return {missing, text: 'QRR1|' + tid + '|' + (r.length <= b.length ? r : b)};
+}
+
+function showRequest(){
+  const {missing, text} = requestPayload();
+  if(!missing.length){ setStatus('Nothing is missing.'); return; }
+  try{
+    const qr = qrcode(0, 'L'); qr.addData(text); qr.make();
+    const holder = $('reqqr');
+    holder.innerHTML = qr.createSvgTag({cellSize:4, margin:4, scalable:true});
+    const svg = holder.querySelector('svg');
+    if(!svg.getAttribute('viewBox')){
+      svg.setAttribute('viewBox', `0 0 ${parseFloat(svg.getAttribute('width'))} ${parseFloat(svg.getAttribute('height'))}`);
+    }
+    svg.removeAttribute('width'); svg.removeAttribute('height'); svg.style.width = '100%'; svg.style.height = 'auto';
+  }catch(e){
+    setStatus('Too many missing frames to fit one request QR — keep scanning a bit more. (' + e.message + ')', true);
+    return;
+  }
+  $('reqtxt').textContent = `${missing.length} missing (frame numbers): ` + missing.map(k=>k+1).join(', ').slice(0, 300);
+  $('reqbox').hidden = false;
+}
+$('req').onclick = showRequest;
+$('reqclose').onclick = () => { $('reqbox').hidden = true; };
+
 function drawProgress(){
+  $('req').disabled = false;
   const have = Object.keys(parts).length;
   $('fill').style.width = (total ? have/total*100 : 0) + '%';
   const cells = $('cells');
